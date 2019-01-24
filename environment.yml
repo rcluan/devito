@@ -1,4 +1,4 @@
-name: devito
+name: devito_custom
 channels:
   - defaults
   - conda-forge

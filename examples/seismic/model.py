@@ -5,7 +5,7 @@ import numpy as np
 from examples.seismic.utils import scipy_smooth
 from devito import Grid, SubDomain, Function, Constant, warning
 
-__all__ = ['Model', 'ModelElastic', 'demo_model']
+__all__ = ['Model', 'ModelElastic', 'ModelViscoAcoustic', 'demo_model']
 
 
 def demo_model(preset, **kwargs):
@@ -673,3 +673,154 @@ class ModelElastic(GenericModel):
         # The CFL condtion is then given by
         # dt < h / (sqrt(2) * max(vp)))
         return self.dtype(.5*np.min(self.spacing) / (np.sqrt(2)*np.max(self.vp.data)))
+
+class ModelViscoAcoustic(GenericModel):
+    """The physical model used in seismic inversion processes.
+
+    :param origin: Origin of the model in m as a tuple in (x,y,z) order
+    :param spacing: Grid size in m as a Tuple in (x,y,z) order
+    :param shape: Number of grid points size in (x,y,z) order
+    :param space_order: Order of the spatial stencil discretisation
+    :param vp: Velocity in km/s
+    :param nbpml: The number of PML layers for boundary damping
+    :param epsilon: Thomsen epsilon parameter (0<epsilon<1)
+    :param delta: Thomsen delta parameter (0<delta<1), delta<epsilon
+    :param theta: Tilt angle in radian
+    :param phi: Asymuth angle in radian
+
+    The :class:`Model` provides two symbolic data objects for the
+    creation of seismic wave propagation operators:
+
+    :param m: The square slowness of the wave
+    :param damp: The damping field for absorbing boundarycondition
+    """
+    def __init__(self, origin, spacing, shape, space_order, vp, Q=None, f0=None, nbpml=20,
+                 dtype=np.float32, epsilon=None, delta=None, theta=None, phi=None,
+                 **kwargs):
+        super(ModelViscoAcoustic, self).__init__(origin, spacing, shape, space_order, nbpml, dtype)
+
+        self.Q = Q
+        self.f0 = f0
+
+        # Are we provided with an existing grid?
+        grid = kwargs.get('grid')
+        if grid is not None:
+            assert self.grid.extent == grid.extent
+            assert self.grid.shape == grid.shape
+            self.grid = grid
+
+        # Create square slowness of the wave as symbol `m`
+        if isinstance(vp, np.ndarray):
+            self.m = Function(name="m", grid=self.grid, space_order=space_order)
+            self.eta_m = Function(name="eta_m", grid=self.grid, space_order=space_order)
+        else:
+            self.m = Constant(name="m", value=1/vp**2)
+            self.eta_m = Constant(name="eta_m", value=(vp**2)/(self.Q*2*np.pi*f0))
+
+        self._physical_parameters = ('m','eta_m',)
+        # Set model velocity, which will also set `m`
+        self.vp = vp
+        self.eta = (vp**2)/(self.Q*2*np.pi*f0)
+
+        # Create dampening field as symbol `damp`
+        self.damp = Function(name="damp", grid=self.grid)
+        initialize_damp(self.damp, self.nbpml, self.spacing)
+
+        # Additional parameter fields for TTI operators
+        self.scale = 1.
+
+        if epsilon is not None:
+            if isinstance(epsilon, np.ndarray):
+                self._physical_parameters += ('epsilon',)
+                self.epsilon = Function(name="epsilon", grid=self.grid)
+                initialize_function(self.epsilon, 1 + 2 * epsilon, self.nbpml)
+                # Maximum velocity is scale*max(vp) if epsilon > 0
+                if np.max(self.epsilon.data_with_halo[:]) > 0:
+                    self.scale = np.sqrt(np.max(self.epsilon.data_with_halo[:]))
+            else:
+                self.epsilon = 1 + 2 * epsilon
+                self.scale = epsilon
+        else:
+            self.epsilon = 1
+
+        if delta is not None:
+            if isinstance(delta, np.ndarray):
+                self._physical_parameters += ('delta',)
+                self.delta = Function(name="delta", grid=self.grid)
+                initialize_function(self.delta, np.sqrt(1 + 2 * delta), self.nbpml)
+            else:
+                self.delta = delta
+        else:
+            self.delta = 1
+
+        if theta is not None:
+            if isinstance(theta, np.ndarray):
+                self._physical_parameters += ('theta',)
+                self.theta = Function(name="theta", grid=self.grid,
+                                      space_order=space_order)
+                initialize_function(self.theta, theta, self.nbpml)
+            else:
+                self.theta = theta
+        else:
+            self.theta = 0
+
+        if phi is not None:
+            if self.grid.dim < 3:
+                warning("2D TTI does not use an azimuth angle Phi, ignoring input")
+                self.phi = 0
+            elif isinstance(phi, np.ndarray):
+                self._physical_parameters += ('phi',)
+                self.phi = Function(name="phi", grid=self.grid, space_order=space_order)
+                initialize_function(self.phi, phi, self.nbpml)
+            else:
+                self.phi = phi
+        else:
+            self.phi = 0
+
+    @property
+    def critical_dt(self):
+        """Critical computational time step value from the CFL condition."""
+        # For a fixed time order this number goes down as the space order increases.
+        #
+        # The CFL condtion is then given by
+        # dt <= coeff * h / (max(velocity))
+        coeff = 0.38 if len(self.shape) == 3 else 0.42
+        dt = self.dtype(coeff * np.min(self.spacing) / (self.scale*np.max(self.vp)))
+        return .001 * int(1000 * dt)
+
+    @property
+    def vp(self):
+        """:class:`numpy.ndarray` holding the model velocity in km/s.
+        .. note::
+        Updating the velocity field also updates the square slowness
+        ``self.m``. However, only ``self.m`` should be used in seismic
+        operators, since it is of type :class:`Function`.
+        """
+        return self._vp
+
+    @vp.setter
+    def vp(self, vp):
+        """Set a new velocity model and update square slowness
+
+        :param vp : new velocity in km/s
+        """
+        self._vp = vp
+
+        # Update the square slowness according to new value
+        if isinstance(vp, np.ndarray):
+            initialize_function(self.m, 1 / (self.vp * self.vp), self.nbpml)
+        else:
+            self.m.data = 1 / vp**2
+
+    @property
+    def eta(self):
+        return self._eta
+
+    @vp.setter
+    def eta(self, eta):
+        self._eta = eta
+
+        if isinstance(eta, np.ndarray):
+            initialize_function(self.eta_m, (self.vp **2) / (self.Q*2*np.pi*self.f0), self.nbpml)
+        else:
+            self.eta_m.data = (self.vp ** 2) / (self.Q*2*np.pi*self.f0)
